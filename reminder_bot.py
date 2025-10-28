@@ -1,713 +1,597 @@
+
+import json
 import os
-import logging
-import calendar as pycal
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone, date
-from zoneinfo import ZoneInfo
-from typing import Dict, Optional
-import secrets
+import uuid
+import calendar
+from dataclasses import dataclass, asdict
+from typing import Dict, Any, Optional, List
+from datetime import datetime, timedelta, time, timezone, date
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    from backports.zoneinfo import ZoneInfo  # type: ignore
 
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove,
 )
 from telegram.ext import (
-    Application, ApplicationBuilder, CallbackContext,
-    CommandHandler, MessageHandler, CallbackQueryHandler,
-    ConversationHandler, filters, Job, JobQueue
+    ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes,
+    ConversationHandler, MessageHandler, filters
 )
 
-# ---------------------- CONFIG ----------------------
 TOKEN = os.getenv("TELEGRAM_TOKEN")
-DEFAULT_TZ = ZoneInfo("Europe/Kyiv")
 
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
-)
-log = logging.getLogger("reminder-bot")
+STORE_FILE = "reminders.json"
+DEFAULT_TZ = "Europe/Kyiv"
 
-# ---------------------- STORAGE ----------------------
-@dataclass
-class Ending:
-    kind: str = "none"        # "none" | "days" | "times"
-    days: int = 0
-    times: int = 0
-
-@dataclass
-class Rem:
-    id: str
-    chat_id: int
-    text: str
-    kind: str                  # "once" | "daily" | "n_days" | "x_hours"
-    tz: ZoneInfo
-    next_dt: datetime
-    n: int = 0
-    hhmm: Optional[str] = None
-    ending: Ending = field(default_factory=Ending)
-    left_times: Optional[int] = None
-    end_date: Optional[datetime] = None
-    paused: bool = False
-    job: Optional[Job] = None
-
-@dataclass
-class ChatState:
-    tz: ZoneInfo = DEFAULT_TZ
-    items: Dict[str, Rem] = field(default_factory=dict)
-
-STORE: Dict[int, ChatState] = {}
-
-def get_state(chat_id: int) -> ChatState:
-    if chat_id not in STORE:
-        STORE[chat_id] = ChatState()
-    return STORE[chat_id]
-
-# ---------------------- CONVERSATION STATES ----------------------
 (
-    S_ENTER_TEXT,
-    S_PICK_KIND,
-    S_ENTER_ONCE_DT,      # (не використовується тепер, але лишаю як посв.)
-    S_ENTER_DAILY_TIME,   # теж не юзаємо напряму
-    S_ENTER_N_DAYS,
-    S_ENTER_X_HOURS,
-    S_ENDING,
-    S_CONFIRM,
-    S_PICK_DATE,          # новий: вибір дати для once
-    S_PICK_TIME,          # новий: вибір часу для once/daily/n_days
-    S_ENTER_N_ONLY        # новий: вводимо N (кожні N днів)
-) = range(11)
+    AWAIT_TEXT,
+    AWAIT_TYPE,
+    AWAIT_N_DAYS,
+    AWAIT_X_HOURS,
+    CAL_PICK,
+    PICK_HOUR,
+    PICK_MINUTE,
+) = range(7)
 
-# ---------------------- UTIL ----------------------
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+TYPE_ONE = "one"
+TYPE_DAILY = "daily"
+TYPE_EVERY_N_DAYS = "n_days"
+TYPE_EVERY_X_HOURS = "x_hours"
 
-def parse_hhmm(s: str) -> Optional[tuple]:
+
+def load_store() -> Dict[str, Any]:
+    if not os.path.exists(STORE_FILE):
+        return {}
+    with open(STORE_FILE, "r", encoding="utf-8") as f:
+        try:
+            return json.load(f)
+        except Exception:
+            return {}
+
+
+def save_store(data: Dict[str, Any]) -> None:
+    with open(STORE_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def get_user_bucket(chat_id: int) -> Dict[str, Any]:
+    store = load_store()
+    bucket = store.get(str(chat_id))
+    if not bucket:
+        bucket = {"tz": DEFAULT_TZ, "reminders": {}, "completed": []}
+        store[str(chat_id)] = bucket
+        save_store(store)
+    return bucket
+
+
+def set_user_bucket(chat_id: int, bucket: Dict[str, Any]) -> None:
+    store = load_store()
+    store[str(chat_id)] = bucket
+    save_store(store)
+
+
+def get_tz(chat_id: int) -> ZoneInfo:
+    bucket = get_user_bucket(chat_id)
+    tzname = bucket.get("tz", DEFAULT_TZ)
     try:
-        hh, mm = s.strip().split(":")
-        h = int(hh); m = int(mm)
-        if 0 <= h < 24 and 0 <= m < 60:
-            return h, m
+        return ZoneInfo(tzname)
     except Exception:
-        pass
-    return None
+        return ZoneInfo("UTC")
 
-def pretty_dt(dt: datetime, tz: ZoneInfo) -> str:
-    return dt.astimezone(tz).strftime("%Y-%m-%d %H:%M")
 
-def kb_main():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Створити нагадування", callback_data="menu_new")],
-        [InlineKeyboardButton("📄 Список нагадувань", callback_data="menu_list")],
-        [InlineKeyboardButton("🕒 Встановити таймзону", callback_data="menu_tz")],
-        [InlineKeyboardButton("ℹ️ Довідка", callback_data="menu_help")],
-    ])
+def fmt_dt(dt_: datetime) -> str:
+    return dt_.strftime("%Y-%m-%d %H:%M")
 
-def kb_kinds():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Одноразове (дата+час)", callback_data="k_once")],
+
+def main_menu_kb() -> InlineKeyboardMarkup:
+    kb = [
+        [InlineKeyboardButton("➕ Створити нагадування", callback_data="menu:new")],
+        [InlineKeyboardButton("📋 Список нагадувань", callback_data="menu:list")],
+        [InlineKeyboardButton("🌍 Встановити таймзону", callback_data="menu:tz")],
+        [InlineKeyboardButton("ℹ️ Довідка", callback_data="menu:help")],
+    ]
+    return InlineKeyboardMarkup(kb)
+
+
+def type_kb() -> InlineKeyboardMarkup:
+    kb = [
+        [InlineKeyboardButton("Одноразове (дата+час)", callback_data=f"type:{TYPE_ONE}")],
         [
-            InlineKeyboardButton("Щодня у HH:MM", callback_data="k_daily"),
-            InlineKeyboardButton("Кожні N днів у HH:MM", callback_data="k_ndays"),
+            InlineKeyboardButton("Щодня у HH:MM", callback_data=f"type:{TYPE_DAILY}"),
+            InlineKeyboardButton("Кожні N днів у HH:MM", callback_data=f"type:{TYPE_EVERY_N_DAYS}"),
         ],
-        [InlineKeyboardButton("Кожні X годин", callback_data="k_xhours")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back_main")],
-    ])
+        [InlineKeyboardButton("Кожні X годин", callback_data=f"type:{TYPE_EVERY_X_HOURS}")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back:menu")],
+    ]
+    return InlineKeyboardMarkup(kb)
 
-def kb_ending():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("Без кінця", callback_data="end_none"),
-            InlineKeyboardButton("Протягом D днів", callback_data="end_days"),
-            InlineKeyboardButton("T разів", callback_data="end_times"),
-        ],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back_main")],
-    ])
 
-def kb_confirm():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Зберегти", callback_data="confirm_save"),
-            InlineKeyboardButton("⬅️ Назад", callback_data="back_main"),
-        ]
-    ])
+def back_to_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад у меню", callback_data="back:menu")]])
 
-def kb_item(rem: Rem):
-    if rem.paused:
-        pr_btn = InlineKeyboardButton("▶️ Відновити", callback_data=f"resume:{rem.id}")
-    else:
-        pr_btn = InlineKeyboardButton("⏸ Пауза", callback_data=f"pause:{rem.id}")
-    return InlineKeyboardMarkup([
-        [pr_btn, InlineKeyboardButton("🗑 Видалити", callback_data=f"del:{rem.id}")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back_main")],
-    ])
 
-# ---------------------- CALENDAR / TIME PICKER ----------------------
-WEEKDAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]
+def list_kb(chat_id: int) -> InlineKeyboardMarkup:
+    bucket = get_user_bucket(chat_id)
+    kb: List[List[InlineKeyboardButton]] = []
+    reminders = bucket.get("reminders", {})
+    if not reminders:
+        return back_to_menu_kb()
+    for rid, r in reminders.items():
+        title = r.get("text", "—")[:28]
+        kb.append([
+            InlineKeyboardButton(f"❌ Скасувати: {title}", callback_data=f"cancel:{rid}")
+        ])
+    kb.append([InlineKeyboardButton("⬅️ Назад", callback_data="back:menu")])
+    return InlineKeyboardMarkup(kb)
 
-def build_calendar(year: int, month: int) -> InlineKeyboardMarkup:
-    """Inline календар для обраного місяця."""
-    cal = pycal.Calendar(firstweekday=0)  # Monday
-    rows = []
 
-    # Заголовок місяця
-    rows.append([
-        InlineKeyboardButton("‹", callback_data=f"calp:{year}-{month:02d}"),
-        InlineKeyboardButton(f"{year}-{month:02d}", callback_data="noop"),
-        InlineKeyboardButton("›", callback_data=f"caln:{year}-{month:02d}"),
-    ])
+def completed_kb(chat_id: int) -> InlineKeyboardMarkup:
+    bucket = get_user_bucket(chat_id)
+    compl = bucket.get("completed", [])
+    kb: List[List[InlineKeyboardButton]] = []
+    if not compl:
+        return back_to_menu_kb()
+    for item in compl[-20:][::-1]:
+        title = item.get("text", "—")[:28]
+        kb.append([InlineKeyboardButton(f"🗂 {title}", callback_data="noop")])
+    kb.append([InlineKeyboardButton("⬅️ Назад", callback_data="back:menu")])
+    return InlineKeyboardMarkup(kb)
 
-    # Шапка днів тижня
-    rows.append([InlineKeyboardButton(w, callback_data="noop") for w in WEEKDAYS])
 
-    # Тіло місяця
-    for week in cal.monthdayscalendar(year, month):
-        btns = []
-        for d in week:
-            if d == 0:
-                btns.append(InlineKeyboardButton(" ", callback_data="noop"))
+def calendar_kb(y: int, m: int) -> InlineKeyboardMarkup:
+    cal = calendar.Calendar(firstweekday=0)
+    weeks = cal.monthdayscalendar(y, m)
+    header = InlineKeyboardButton(f"{calendar.month_name[m]} {y}", callback_data="noop")
+    prev_m = m - 1 or 12
+    prev_y = y - 1 if m == 1 else y
+    next_m = (m % 12) + 1
+    next_y = y + 1 if m == 12 else y
+    rows: List[List[InlineKeyboardButton]] = [
+        [InlineKeyboardButton("‹", callback_data=f"cal:prev:{prev_y}:{prev_m}"), header,
+         InlineKeyboardButton("›", callback_data=f"cal:next:{next_y}:{next_m}")],
+        [InlineKeyboardButton(d, callback_data="noop") for d in ["Mo","Tu","We","Th","Fr","Sa","Su"]]
+    ]
+    for w in weeks:
+        row = []
+        for day in w:
+            if day == 0:
+                row.append(InlineKeyboardButton(" ", callback_data="noop"))
             else:
-                btns.append(InlineKeyboardButton(str(d), callback_data=f"cald:{year}-{month:02d}-{d:02d}"))
-        rows.append(btns)
-
-    # Низ
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_kind")])
+                row.append(InlineKeyboardButton(str(day), callback_data=f"cal:pick:{y}:{m}:{day}"))
+        rows.append(row)
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back:type")])
     return InlineKeyboardMarkup(rows)
 
-def build_time_picker(h: int, m: int) -> InlineKeyboardMarkup:
-    """Inline пікер часу."""
-    disp = f"{h:02d}:{m:02d}"
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("− год", callback_data="tp:h-"),
-         InlineKeyboardButton(f"🕐 {disp}", callback_data="noop"),
-         InlineKeyboardButton("+ год", callback_data="tp:h+")],
-        [InlineKeyboardButton("− хв", callback_data="tp:m-"),
-         InlineKeyboardButton("00", callback_data="tp:q:00"),
-         InlineKeyboardButton("15", callback_data="tp:q:15"),
-         InlineKeyboardButton("30", callback_data="tp:q:30"),
-         InlineKeyboardButton("45", callback_data="tp:q:45"),
-         InlineKeyboardButton("+ хв", callback_data="tp:m+")],
-        [InlineKeyboardButton("✅ ОК", callback_data="tp:ok"),
-         InlineKeyboardButton("⬅️ Назад", callback_data="back_kind")]
-    ])
 
-def round_future_30(now_local: datetime) -> tuple:
-    """Найближчі майбутні 00/30 хв."""
-    h = now_local.hour
-    m = 30 if now_local.minute < 30 else 0
-    if m == 0:
-        # якщо було >=30, переносимо на наступну годину
-        h = (h + 1) % 24
-    return h, m
+def hours_kb() -> InlineKeyboardMarkup:
+    hours = [f"{h:02d}" for h in range(0, 24)]
+    rows = []
+    for i in range(0, 24, 6):
+        rows.append([InlineKeyboardButton(h, callback_data=f"hour:{h}") for h in hours[i:i+6]])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back:calendar")])
+    return InlineKeyboardMarkup(rows)
 
-# ---------------------- SCHEDULING ----------------------
-def schedule_rem(app: Application, rem: Rem):
-    if rem.job:
-        try:
-            rem.job.schedule_removal()
-        except Exception:
-            pass
-        rem.job = None
 
-    delay = max(1, int((rem.next_dt - utcnow()).total_seconds()))
-    rem.job = app.job_queue.run_once(job_fire, when=delay, data={"id": rem.id}, name=rem.id)
-    log.info("scheduled %s at %s", rem.id, rem.next_dt)
+def minutes_kb() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("00", callback_data="min:00"),
+         InlineKeyboardButton("15", callback_data="min:15"),
+         InlineKeyboardButton("30", callback_data="min:30"),
+         InlineKeyboardButton("45", callback_data="min:45")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back:hour")]
+    ]
+    return InlineKeyboardMarkup(rows)
 
-def reschedule_after_fire(rem: Rem):
-    tz = rem.tz
-    now_local = utcnow().astimezone(tz)
-    if rem.kind == "once":
-        rem.next_dt = None
-        return
-    if rem.kind == "daily":
-        h, m = parse_hhmm(rem.hhmm)
-        rem.next_dt = (now_local.replace(hour=h, minute=m, second=0, microsecond=0) + timedelta(days=1)).astimezone(timezone.utc)
-    elif rem.kind == "n_days":
-        h, m = parse_hhmm(rem.hhmm)
-        base = rem.next_dt.astimezone(tz) if rem.next_dt else now_local
-        rem.next_dt = (base.replace(hour=h, minute=m, second=0, microsecond=0) + timedelta(days=rem.n)).astimezone(timezone.utc)
-    elif rem.kind == "x_hours":
-        base = rem.next_dt.astimezone(tz) if rem.next_dt else now_local
-        rem.next_dt = (base + timedelta(hours=rem.n)).astimezone(timezone.utc)
 
-# ---------------------- JOB CALLBACK ----------------------
-async def job_fire(ctx: CallbackContext):
-    rem_id = ctx.job.data["id"]
-    rem: Optional[Rem] = None
-    for ch_id, st in STORE.items():
-        if rem_id in st.items:
-            rem = st.items[rem_id]
-            break
-    if not rem or rem.paused:
-        return
-
-    try:
-        await ctx.bot.send_message(rem.chat_id, f"⏰ *Нагадування*: {rem.text}", parse_mode="Markdown", reply_markup=kb_item(rem))
-    except Exception as e:
-        log.exception("send failed: %s", e)
-
-    # обмеження
-    if rem.ending.kind == "times":
-        rem.left_times = (rem.left_times or rem.ending.times) - 1
-        if rem.left_times <= 0:
-            try:
-                rem.job.schedule_removal()
-            except Exception:
-                pass
-            get_state(rem.chat_id).items.pop(rem.id, None)
-            return
-    if rem.ending.kind == "days" and rem.end_date:
-        if utcnow().astimezone(rem.tz) >= rem.end_date:
-            try:
-                rem.job.schedule_removal()
-            except Exception:
-                pass
-            get_state(rem.chat_id).items.pop(rem.id, None)
-            return
-
-    reschedule_after_fire(rem)
-    if rem.next_dt:
-        schedule_rem(ctx.application, rem)
-
-# ---------------------- COMMANDS ----------------------
-async def start_cmd(upd: Update, ctx: CallbackContext):
-    await upd.effective_message.reply_text(
-        "👋 Привіт! Я — бот-нагадувач.\nНатисни кнопку, щоб створити нагадування.",
-        reply_markup=kb_main(),
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    tz = get_tz(chat_id)
+    await update.effective_message.reply_text(
+        f"👋 Привіт! Я — бот-нагадувач.\n"
+        f"Поточна таймзона: {tz.key}\n\n"
+        f"Просто натисни кнопку нижче, щоб створити нагадування.",
+        reply_markup=main_menu_kb(),
     )
-
-async def help_cmd(upd: Update, ctx: CallbackContext):
-    await upd.effective_message.reply_text(
-        "Можливості:\n"
-        "• Одноразові (календар + час)\n"
-        "• Щодня у HH:MM (пікер часу)\n"
-        "• Кожні N днів у HH:MM (спершу N, потім пікер часу)\n"
-        "• Кожні X годин (число)\n"
-        "• Обмеження: без кінця / D днів / T разів\n\n"
-        "Команди: /start /list /tz Europe/Kyiv /help"
-    )
-
-async def tz_cmd(upd: Update, ctx: CallbackContext):
-    st = get_state(upd.effective_chat.id)
-    if ctx.args:
-        try:
-            st.tz = ZoneInfo(ctx.args[0])
-            await upd.effective_message.reply_text(f"✅ Таймзона встановлена: {ctx.args[0]}")
-        except Exception:
-            await upd.effective_message.reply_text("❌ Невірна таймзона. Приклад: /tz Europe/Kyiv")
-    else:
-        await upd.effective_message.reply_text(f"Поточна таймзона: {getattr(st.tz,'key',str(st.tz))}")
-
-async def list_cmd(upd: Update, ctx: CallbackContext):
-    st = get_state(upd.effective_chat.id)
-    if not st.items:
-        await upd.effective_message.reply_text("Список порожній.", reply_markup=kb_main())
-        return
-    parts = []
-    for r in st.items.values():
-        mark = "⏸" if r.paused else "▶️"
-        nxt = pretty_dt(r.next_dt, r.tz) if r.next_dt else "—"
-        parts.append(f"{mark} *{r.text}*\n   id:`{r.id}` наступне: {nxt}")
-    await upd.effective_message.reply_text("\n\n".join(parts), parse_mode="Markdown", reply_markup=kb_main())
-
-# ---------------------- MENU CALLBACKS ----------------------
-async def menu_cb(upd: Update, ctx: CallbackContext):
-    q = upd.callback_query
-    await q.answer()
-    data = q.data
-    chat_id = q.message.chat.id
-    st = get_state(chat_id)
-
-    if data == "menu_new":
-        await q.message.reply_text("Введи текст нагадування (що нагадати):")
-        return S_ENTER_TEXT
-
-    if data == "menu_list":
-        return await list_cmd(upd, ctx)
-
-    if data == "menu_tz":
-        await q.message.reply_text("Надішли команду: /tz Europe/Kyiv")
-        return ConversationHandler.END
-
-    if data == "menu_help":
-        return await help_cmd(upd, ctx)
-
-    # керування елементом
-    if data.startswith("pause:"):
-        rid = data.split(":",1)[1]; r = st.items.get(rid)
-        if r:
-            r.paused = True
-            if r.job:
-                try: r.job.schedule_removal()
-                except: pass
-                r.job = None
-            await q.edit_message_reply_markup(reply_markup=kb_item(r))
-        return
-    if data.startswith("resume:"):
-        rid = data.split(":",1)[1]; r = st.items.get(rid)
-        if r:
-            r.paused = False
-            if not r.next_dt:
-                # підстрахуємо
-                if r.kind == "daily":
-                    h,m = parse_hhmm(r.hhmm)
-                    now = datetime.now(r.tz)
-                    cand = now.replace(hour=h, minute=m, second=0, microsecond=0)
-                    if cand <= now: cand += timedelta(days=1)
-                    r.next_dt = cand.astimezone(timezone.utc)
-                elif r.kind == "n_days":
-                    h,m = parse_hhmm(r.hhmm)
-                    now = datetime.now(r.tz)
-                    cand = now.replace(hour=h, minute=m, second=0, microsecond=0) + timedelta(days=r.n)
-                    r.next_dt = cand.astimezone(timezone.utc)
-                elif r.kind == "x_hours":
-                    r.next_dt = (datetime.now(r.tz)+timedelta(hours=r.n)).astimezone(timezone.utc)
-            schedule_rem(ctx.application, r)
-            await q.edit_message_reply_markup(reply_markup=kb_item(r))
-        return
-    if data.startswith("del:"):
-        rid = data.split(":",1)[1]; r = st.items.pop(rid, None)
-        if r and r.job:
-            try: r.job.schedule_removal()
-            except: pass
-        await q.edit_message_text("🗑 Видалено.", reply_markup=kb_main())
-        return
-
-    if data == "back_main":
-        await q.message.reply_text("Головне меню:", reply_markup=kb_main())
-        return ConversationHandler.END
-
-# ---------------------- CONVERSATION FLOW ----------------------
-async def w_enter_text(upd: Update, ctx: CallbackContext):
-    ctx.user_data["tmp_text"] = upd.effective_message.text.strip()
-    await upd.effective_message.reply_text("Обери тип нагадування:", reply_markup=kb_kinds())
-    return S_PICK_KIND
-
-async def w_pick_kind(upd: Update, ctx: CallbackContext):
-    q = upd.callback_query
-    await q.answer()
-    st = get_state(q.message.chat.id)
-    data = q.data
-
-    if data == "k_once":
-        ctx.user_data["tmp_kind"] = "once"
-        now = datetime.now(st.tz)
-        ctx.user_data["pick_year"] = now.year
-        ctx.user_data["pick_month"] = now.month
-        await q.message.reply_text("Вибери дату:", reply_markup=build_calendar(now.year, now.month))
-        return S_PICK_DATE
-
-    if data == "k_daily":
-        ctx.user_data["tmp_kind"] = "daily"
-        now = datetime.now(st.tz)
-        h,m = round_future_30(now)
-        ctx.user_data["tp_h"] = h; ctx.user_data["tp_m"] = m
-        await q.message.reply_text("Вибери час:", reply_markup=build_time_picker(h,m))
-        return S_PICK_TIME
-
-    if data == "k_ndays":
-        ctx.user_data["tmp_kind"] = "n_days"
-        await q.message.reply_text("Введи N — кожні N днів (напр. `2`).")
-        return S_ENTER_N_ONLY
-
-    if data == "k_xhours":
-        ctx.user_data["tmp_kind"] = "x_hours"
-        await q.message.reply_text("Введи X — кожні X годин (напр. `3`).")
-        return S_ENTER_X_HOURS
-
-async def w_enter_n_only(upd: Update, ctx: CallbackContext):
-    s = upd.effective_message.text.strip()
-    try:
-        n = int(s)
-        if n <= 0: raise ValueError()
-        ctx.user_data["tmp_n"] = n
-        st = get_state(upd.effective_chat.id)
-        now = datetime.now(st.tz)
-        h,m = round_future_30(now)
-        ctx.user_data["tp_h"] = h; ctx.user_data["tp_m"] = m
-        await upd.effective_message.reply_text(f"N = {n}. Тепер вибери час:", reply_markup=build_time_picker(h,m))
-        return S_PICK_TIME
-    except Exception:
-        await upd.effective_message.reply_text("Введи додатне ціле число, напр. `2`.")
-        return S_ENTER_N_ONLY
-
-# ----- calendar handlers -----
-async def calendar_cb(upd: Update, ctx: CallbackContext):
-    q = upd.callback_query
-    await q.answer()
-    st = get_state(q.message.chat.id)
-    data = q.data
-
-    year = ctx.user_data.get("pick_year", datetime.now(st.tz).year)
-    month = ctx.user_data.get("pick_month", datetime.now(st.tz).month)
-
-    if data.startswith("calp:"):  # prev month
-        y,m = map(int, data.split(":")[1].split("-"))
-        month = m - 1
-        year = y
-        if month == 0:
-            month = 12; year -= 1
-        ctx.user_data["pick_year"] = year; ctx.user_data["pick_month"] = month
-        await q.edit_message_reply_markup(reply_markup=build_calendar(year, month))
-        return S_PICK_DATE
-
-    if data.startswith("caln:"):  # next month
-        y,m = map(int, data.split(":")[1].split("-"))
-        month = m + 1
-        year = y
-        if month == 13:
-            month = 1; year += 1
-        ctx.user_data["pick_year"] = year; ctx.user_data["pick_month"] = month
-        await q.edit_message_reply_markup(reply_markup=build_calendar(year, month))
-        return S_PICK_DATE
-
-    if data.startswith("cald:"):
-        y, m, d = map(int, data.split(":")[1].split("-"))
-        ctx.user_data["picked_date"] = date(y,m,d)
-        # далі час
-        now = datetime.now(st.tz)
-        h, mm = round_future_30(now)
-        ctx.user_data["tp_h"] = h; ctx.user_data["tp_m"] = mm
-        await q.message.reply_text(f"Обрана дата: {y}-{m:02d}-{d:02d}. Вибери час:", reply_markup=build_time_picker(h,mm))
-        return S_PICK_TIME
-
-    if data == "back_kind":
-        await q.message.reply_text("Обери тип:", reply_markup=kb_kinds())
-        return S_PICK_KIND
-
-# ----- time picker handlers -----
-def clamp_time(h: int, m: int) -> tuple:
-    h %= 24
-    m %= 60
-    return h, m
-
-async def time_cb(upd: Update, ctx: CallbackContext):
-    q = upd.callback_query
-    await q.answer()
-    data = q.data
-
-    h = ctx.user_data.get("tp_h", 9)
-    m = ctx.user_data.get("tp_m", 0)
-
-    if data == "tp:h-":
-        h -= 1
-    elif data == "tp:h+":
-        h += 1
-    elif data == "tp:m-":
-        m -= 5
-    elif data == "tp:m+":
-        m += 5
-    elif data.startswith("tp:q:"):
-        m = int(data.split(":")[2])
-    elif data == "tp:ok":
-        # завершили вибір часу
-        ctx.user_data["tp_h"] = h; ctx.user_data["tp_m"] = m
-        return await after_time_picked(q, ctx)
-
-    h, m = clamp_time(h, m)
-    ctx.user_data["tp_h"] = h; ctx.user_data["tp_m"] = m
-    await q.edit_message_reply_markup(reply_markup=build_time_picker(h,m))
-    return S_PICK_TIME
-
-async def after_time_picked(q, ctx: CallbackContext):
-    chat_id = q.message.chat.id
-    st = get_state(chat_id)
-    kind = ctx.user_data["tmp_kind"]
-    h = ctx.user_data["tp_h"]; m = ctx.user_data["tp_m"]
-
-    if kind == "once":
-        d: date = ctx.user_data["picked_date"]
-        dt_local = datetime(d.year, d.month, d.day, h, m, tzinfo=st.tz)
-        if dt_local <= datetime.now(st.tz):
-            await q.message.reply_text("⛔ Дата/час у минулому. Обери знову:", reply_markup=build_calendar(d.year, d.month))
-            return S_PICK_DATE
-        ctx.user_data["tmp_next"] = dt_local.astimezone(timezone.utc)
-        await q.message.reply_text("Обери обмеження:", reply_markup=kb_ending())
-        return S_ENDING
-
-    if kind == "daily":
-        ctx.user_data["tmp_hhmm"] = f"{h:02d}:{m:02d}"
-        await q.message.reply_text("Обери обмеження:", reply_markup=kb_ending())
-        return S_ENDING
-
-    if kind == "n_days":
-        ctx.user_data["tmp_hhmm"] = f"{h:02d}:{m:02d}"
-        await q.message.reply_text("Обери обмеження:", reply_markup=kb_ending())
-        return S_ENDING
-
-# ----- ending -----
-async def ending_choice_cb(upd: Update, ctx: CallbackContext):
-    q = upd.callback_query
-    await q.answer()
-    data = q.data
-    ctx.user_data["end_choice"] = data
-    if data == "end_none":
-        ctx.user_data["ending"] = Ending("none")
-        return await show_confirm(q, ctx)
-    if data == "end_days":
-        await q.message.reply_text("Введи D — кількість днів (напр. `7`).")
-        return S_ENDING
-    if data == "end_times":
-        await q.message.reply_text("Введи T — кількість разів (напр. `10`).")
-        return S_ENDING
-
-async def ending_value_msg(upd: Update, ctx: CallbackContext):
-    choice = ctx.user_data.get("end_choice")
-    s = upd.effective_message.text.strip()
-    if choice == "end_days":
-        try:
-            d = int(s); assert d > 0
-            ctx.user_data["ending"] = Ending("days", days=d)
-            return await show_confirm(upd, ctx)
-        except Exception:
-            await upd.effective_message.reply_text("Введи додатне ціле число, напр. `7`.")
-            return S_ENDING
-    if choice == "end_times":
-        try:
-            t = int(s); assert t > 0
-            ctx.user_data["ending"] = Ending("times", times=t)
-            return await show_confirm(upd, ctx)
-        except Exception:
-            await upd.effective_message.reply_text("Введи додатне ціле число, напр. `10`.")
-            return S_ENDING
-    # дефолт
-    ctx.user_data["ending"] = Ending("none")
-    return await show_confirm(upd, ctx)
-
-# ----- confirm -----
-async def show_confirm(src, ctx: CallbackContext):
-    if hasattr(src, "effective_message"):
-        msg = src.effective_message
-        chat_id = src.effective_chat.id
-    else:
-        msg = src.message
-        chat_id = src.message.chat.id
-
-    st = get_state(chat_id)
-    tz = st.tz
-    text = ctx.user_data["tmp_text"]
-    kind = ctx.user_data["tmp_kind"]
-    ending: Ending = ctx.user_data.get("ending", Ending("none"))
-
-    if kind == "once":
-        next_dt = ctx.user_data["tmp_next"]
-        preview = pretty_dt(next_dt, tz)
-    elif kind == "daily":
-        hhmm = ctx.user_data["tmp_hhmm"]
-        h,m = parse_hhmm(hhmm)
-        now = datetime.now(tz)
-        cand = now.replace(hour=h, minute=m, second=0, microsecond=0)
-        if cand <= now: cand += timedelta(days=1)
-        next_dt = cand.astimezone(timezone.utc)
-        preview = pretty_dt(next_dt, tz) + f" (щодня {hhmm})"
-    elif kind == "n_days":
-        n = ctx.user_data["tmp_n"]; hhmm = ctx.user_data["tmp_hhmm"]
-        h,m = parse_hhmm(hhmm)
-        now = datetime.now(tz)
-        cand = now.replace(hour=h, minute=m, second=0, microsecond=0)
-        if cand <= now: cand += timedelta(days=n)
-        next_dt = cand.astimezone(timezone.utc)
-        preview = pretty_dt(next_dt, tz) + f" (кожні {n} дн. о {hhmm})"
-    else:  # x_hours
-        n = ctx.user_data["tmp_n"]
-        next_dt = (datetime.now(tz) + timedelta(hours=n)).astimezone(timezone.utc)
-        preview = pretty_dt(next_dt, tz) + f" (кожні {n} год.)"
-
-    ctx.user_data["computed_next"] = next_dt
-
-    if ending.kind == "none":
-        end_txt = "без обмежень"
-    elif ending.kind == "days":
-        end_txt = f"протягом {ending.days} днів"
-    else:
-        end_txt = f"{ending.times} разів"
-
-    await msg.reply_text(
-        f"Перевір:\n• Текст: *{text}*\n• Перше спрацювання: *{preview}*\n• Обмеження: *{end_txt}*",
-        parse_mode="Markdown",
-        reply_markup=kb_confirm(),
-    )
-    return S_CONFIRM
-
-async def do_save(upd: Update, ctx: CallbackContext):
-    q = upd.callback_query
-    await q.answer()
-    chat_id = q.message.chat.id
-    st = get_state(chat_id)
-    tz = st.tz
-
-    rid = secrets.token_hex(3)
-    text = ctx.user_data["tmp_text"]
-    kind = ctx.user_data["tmp_kind"]
-    ending: Ending = ctx.user_data.get("ending", Ending("none"))
-    next_dt = ctx.user_data["computed_next"]
-
-    rem = Rem(id=rid, chat_id=chat_id, text=text, kind=kind, tz=tz, next_dt=next_dt)
-
-    if kind == "daily":
-        rem.hhmm = ctx.user_data["tmp_hhmm"]
-    if kind == "n_days":
-        rem.n = ctx.user_data["tmp_n"]
-        rem.hhmm = ctx.user_data["tmp_hhmm"]
-    if kind == "x_hours":
-        rem.n = ctx.user_data["tmp_n"]
-    rem.ending = ending
-    if ending.kind == "times":
-        rem.left_times = ending.times
-    if ending.kind == "days":
-        rem.end_date = datetime.now(tz) + timedelta(days=ending.days)
-
-    st.items[rem.id] = rem
-    schedule_rem(upd.application, rem)
-
-    await q.edit_message_text(
-        f"✅ Збережено! id:`{rem.id}`\nПерше спрацювання: *{pretty_dt(rem.next_dt, tz)}*",
-        parse_mode="Markdown",
-        reply_markup=kb_item(rem),
-    )
-    ctx.user_data.clear()
     return ConversationHandler.END
 
-# ---------------------- BUILD APP ----------------------
-def build_application() -> Application:
-    app = ApplicationBuilder().token(TOKEN).build()
 
-    conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(menu_cb, pattern="^menu_new$")],
-        states={
-            S_ENTER_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, w_enter_text)],
-            S_PICK_KIND: [CallbackQueryHandler(w_pick_kind, pattern="^(k_once|k_daily|k_ndays|k_xhours)$")],
-            S_ENTER_N_ONLY: [MessageHandler(filters.TEXT & ~filters.COMMAND, w_enter_n_only)],
-            S_PICK_DATE: [CallbackQueryHandler(calendar_cb, pattern="^(cal[dpn]:|cald:|back_kind)$")],
-            S_PICK_TIME: [CallbackQueryHandler(time_cb, pattern="^(tp:|back_kind)$")],
-            S_ENDING: [
-                CallbackQueryHandler(ending_choice_cb, pattern="^end_(none|days|times)$"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, ending_value_msg),
-            ],
-            S_CONFIRM: [
-                CallbackQueryHandler(do_save, pattern="^confirm_save$"),
-                CallbackQueryHandler(menu_cb, pattern="^back_main$"),
-            ],
-        },
-        fallbacks=[CallbackQueryHandler(menu_cb, pattern="^back_main$")],
-        allow_reentry=True,
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        "Команди:\n"
+        "/start — меню\n"
+        "/list — список активних нагадувань\n"
+        "/completed — виконані\n"
+        "/tz <Region/City> — встановити таймзону (напр. /tz Europe/Kyiv)\n"
     )
 
-    # Команди
-    app.add_handler(CommandHandler("start", start_cmd))
+
+async def tz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    args = context.args
+    if not args:
+        tz = get_tz(chat_id)
+        await update.effective_message.reply_text(f"Поточна таймзона: {tz.key}")
+        return
+    tzname = " ".join(args)
+    try:
+        _ = ZoneInfo(tzname)
+    except Exception:
+        await update.effective_message.reply_text("⚠️ Невірна таймзона. Приклад: /tz Europe/Kyiv")
+        return
+    bucket = get_user_bucket(chat_id)
+    bucket["tz"] = tzname
+    set_user_bucket(chat_id, bucket)
+    await update.effective_message.reply_text(f"✅ Таймзона встановлена: {tzname}")
+
+
+async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    bucket = get_user_bucket(chat_id)
+    reminders = bucket.get("reminders", {})
+    if not reminders:
+        await update.effective_message.reply_text("Активних нагадувань немає.", reply_markup=back_to_menu_kb())
+        return
+    lines = ["🗒 Активні нагадування:"]
+    for r in reminders.values():
+        lines.append(f"• {r.get('text')} — {r.get('human')}")
+    await update.effective_message.reply_text("\n".join(lines), reply_markup=list_kb(chat_id))
+
+
+async def completed_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    bucket = get_user_bucket(chat_id)
+    compl = bucket.get("completed", [])
+    if not compl:
+        await update.effective_message.reply_text("Поки немає виконаних.", reply_markup=back_to_menu_kb())
+        return
+    lines = ["🗂 Останні виконані:"]
+    for item in compl[-10:][::-1]:
+        lines.append(f"• {item.get('text')} — {item.get('human')}")
+    await update.effective_message.reply_text("\n".join(lines), reply_markup=completed_kb(chat_id))
+
+
+async def cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+
+    if data.startswith("menu:"):
+        action = data.split(":")[1]
+        if action == "new":
+            context.user_data["new"] = {"text": None, "type": None, "dt": None, "hour": None, "minute": None,
+                                        "n_days": None, "x_hours": None}
+            await query.message.reply_text("Введи текст нагадування (що нагадати):")
+            return AWAIT_TEXT
+        elif action == "list":
+            await list_cmd(update, context)
+        elif action == "tz":
+            await query.message.reply_text("Вкажи таймзону у форматі Region/City, напр.: /tz Europe/Kyiv")
+        elif action == "help":
+            await help_cmd(update, context)
+        return ConversationHandler.END
+
+    if data == "back:menu":
+        await query.message.reply_text("Головне меню:", reply_markup=main_menu_kb())
+        return ConversationHandler.END
+
+    if data == "back:type":
+        await query.message.reply_text("Обери тип:", reply_markup=type_kb())
+        return AWAIT_TYPE
+
+    if data == "back:calendar":
+        # return to calendar of stored month
+        sel = context.user_data.get("cal_month")
+        y, m = sel if sel else (date.today().year, date.today().month)
+        await query.message.reply_text("Оберіть дату:", reply_markup=calendar_kb(y, m))
+        return CAL_PICK
+
+    if data == "back:hour":
+        await query.message.reply_text("Оберіть годину:", reply_markup=hours_kb())
+        return PICK_HOUR
+
+    if data.startswith("type:"):
+        tp = data.split(":")[1]
+        context.user_data["new"]["type"] = tp
+        if tp == TYPE_ONE:
+            today = date.today()
+            context.user_data["cal_month"] = (today.year, today.month)
+            await query.message.reply_text("Оберіть дату:", reply_markup=calendar_kb(today.year, today.month))
+            return CAL_PICK
+        elif tp == TYPE_DAILY:
+            await query.message.reply_text("Оберіть годину:", reply_markup=hours_kb())
+            return PICK_HOUR
+        elif tp == TYPE_EVERY_N_DAYS:
+            kb = [
+                [InlineKeyboardButton(str(x), callback_data=f"ndays:{x}") for x in [1,2,3,5,7]],
+                [InlineKeyboardButton("⬅️ Назад", callback_data="back:type")]
+            ]
+            await query.message.reply_text("Оберіть кожні N днів:", reply_markup=InlineKeyboardMarkup(kb))
+            return AWAIT_N_DAYS
+        elif tp == TYPE_EVERY_X_HOURS:
+            kb = [
+                [InlineKeyboardButton(h, callback_data=f"xhrs:{h}") for h in ["1","2","3","4"]],
+                [InlineKeyboardButton(h, callback_data=f"xhrs:{h}") for h in ["6","8","12","24"]],
+                [InlineKeyboardButton("⬅️ Назад", callback_data="back:type")]
+            ]
+            await query.message.reply_text("Оберіть інтервал (години):", reply_markup=InlineKeyboardMarkup(kb))
+            return AWAIT_X_HOURS
+
+    if data.startswith("cal:"):
+        _, act, y, m = data.split(":")[0:4]
+        y = int(y); m = int(m)
+        if act in ("prev", "next"):
+            context.user_data["cal_month"] = (y, m)
+            await query.message.reply_text("Оберіть дату:", reply_markup=calendar_kb(y, m))
+            return CAL_PICK
+        if act == "pick":
+            d = int(data.split(":")[4])
+            context.user_data["new"]["dt"] = date(y, m, d)
+            await query.message.reply_text("Оберіть годину:", reply_markup=hours_kb())
+            return PICK_HOUR
+
+    if data.startswith("hour:"):
+        hr = int(data.split(":")[1])
+        context.user_data["new"]["hour"] = hr
+        await query.message.reply_text("Оберіть хвилини:", reply_markup=minutes_kb())
+        return PICK_MINUTE
+
+    if data.startswith("min:"):
+        minute = int(data.split(":")[1])
+        context.user_data["new"]["minute"] = minute
+        await finalize_creation(update, context)
+        return ConversationHandler.END
+
+    if data.startswith("ndays:"):
+        n = int(data.split(":")[1])
+        context.user_data["new"]["n_days"] = n
+        await query.message.reply_text("Оберіть годину:", reply_markup=hours_kb())
+        return PICK_HOUR
+
+    if data.startswith("xhrs:"):
+        x = int(data.split(":")[1])
+        context.user_data["new"]["x_hours"] = x
+        await finalize_creation(update, context)
+        return ConversationHandler.END
+
+    if data.startswith("cancel:"):
+        rid = data.split(":")[1]
+        await cancel_reminder(update, context, rid, user_initiated=True)
+        return ConversationHandler.END
+
+    if data.startswith("done:"):
+        rid = data.split(":")[1]
+        await mark_done(update, context, rid)
+        return ConversationHandler.END
+
+    return ConversationHandler.END
+
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Accept reminder text
+    if "new" not in context.user_data:
+        await update.effective_message.reply_text("Скористайся меню /start")
+        return ConversationHandler.END
+    context.user_data["new"]["text"] = update.effective_message.text.strip()
+    await update.effective_message.reply_text("Обери тип нагадування:", reply_markup=type_kb())
+    return AWAIT_TYPE
+
+
+async def finalize_creation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    tz = get_tz(chat_id)
+    new = context.user_data.get("new", {})
+    text = new.get("text")
+    tp = new.get("type")
+    hour = new.get("hour")
+    minute = new.get("minute", 0)
+
+    rid = str(uuid.uuid4())
+
+    if tp == TYPE_ONE:
+        d: date = new.get("dt")
+        dt_local = datetime(d.year, d.month, d.day, hour or 0, minute or 0, tzinfo=tz)
+        when_utc = dt_local.astimezone(timezone.utc)
+        human = f"одноразово — {fmt_dt(dt_local)}"
+        schedule_once(context, chat_id, rid, text, human, when_utc)
+    elif tp == TYPE_DAILY:
+        t_local = time(hour or 0, minute or 0, tzinfo=tz)
+        human = f"щодня — {t_local.strftime('%H:%M')}"
+        schedule_daily(context, chat_id, rid, text, human, t_local)
+    elif tp == TYPE_EVERY_N_DAYS:
+        n = int(new.get("n_days") or 1)
+        t_local = time(hour or 0, minute or 0, tzinfo=tz)
+        human = f"кожні {n} дн. — {t_local.strftime('%H:%M')}"
+        schedule_every_n_days(context, chat_id, rid, text, human, t_local, n, tz)
+    elif tp == TYPE_EVERY_X_HOURS:
+        x = int(new.get("x_hours") or 1)
+        human = f"кожні {x} год."
+        schedule_every_x_hours(context, chat_id, rid, text, human, x)
+
+    # store
+    bucket = get_user_bucket(chat_id)
+    bucket["reminders"][rid] = {
+        "id": rid,
+        "text": text,
+        "type": tp,
+        "hour": hour,
+        "minute": minute,
+        "tz": tz.key,
+        "human": human,
+        "dt": new.get("dt").isoformat() if new.get("dt") else None,
+        "n_days": new.get("n_days"),
+        "x_hours": new.get("x_hours"),
+    }
+    set_user_bucket(chat_id, bucket)
+    context.user_data.pop("new", None)
+
+    await update.effective_message.reply_text(f"✅ Створено нагадування: “{text}”\n{human}",
+                                              reply_markup=main_menu_kb())
+
+
+def reminder_kb(rid: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Виконано", callback_data=f"done:{rid}"),
+        InlineKeyboardButton("✖️ Скасувати", callback_data=f"cancel:{rid}")
+    ]])
+
+
+async def fire_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
+    job = context.job
+    payload = job.data
+    chat_id = payload["chat_id"]
+    rid = payload["rid"]
+    text = payload["text"]
+    human = payload["human"]
+    await context.bot.send_message(chat_id, f"⏰ *Нагадування:* {text}\n_{human}_",
+                                   parse_mode="Markdown",
+                                   reply_markup=reminder_kb(rid))
+
+
+async def cancel_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE, rid: str, user_initiated: bool):
+    chat_id = update.effective_chat.id
+    # cancel job
+    for j in context.job_queue.get_jobs_by_name(rid):
+        j.schedule_removal()
+    # drop from store
+    bucket = get_user_bucket(chat_id)
+    rem = bucket["reminders"].pop(rid, None)
+    set_user_bucket(chat_id, bucket)
+    if user_initiated:
+        await update.callback_query.edit_message_text("❌ Нагадування скасовано.")
+    else:
+        await context.bot.send_message(chat_id, "❌ Нагадування скасовано.")
+
+
+async def mark_done(update: Update, context: ContextTypes.DEFAULT_TYPE, rid: str):
+    chat_id = update.effective_chat.id
+    # cancel job(s)
+    for j in context.job_queue.get_jobs_by_name(rid):
+        j.schedule_removal()
+    # move to completed
+    bucket = get_user_bucket(chat_id)
+    rem = bucket["reminders"].pop(rid, None)
+    if rem:
+        bucket["completed"].append(rem)
+    set_user_bucket(chat_id, bucket)
+    await update.callback_query.edit_message_text("✅ Відмічено як виконано. Перенесено в ‘виконані’.")
+
+
+def schedule_once(context: ContextTypes.DEFAULT_TYPE, chat_id: int, rid: str, text: str, human: str, when_utc):
+    context.job_queue.run_once(
+        fire_reminder,
+        when=when_utc,
+        name=rid,
+        data={"chat_id": chat_id, "rid": rid, "text": text, "human": human},
+    )
+
+
+def schedule_daily(context: ContextTypes.DEFAULT_TYPE, chat_id: int, rid: str, text: str, human: str, t_local):
+    context.job_queue.run_daily(
+        fire_reminder,
+        time=t_local,
+        days=(0,1,2,3,4,5,6),
+        name=rid,
+        data={"chat_id": chat_id, "rid": rid, "text": text, "human": human},
+    )
+
+
+def schedule_every_n_days(context: ContextTypes.DEFAULT_TYPE, chat_id: int, rid: str, text: str, human: str,
+                          t_local, n_days: int, tz: ZoneInfo):
+    now = datetime.now(tz)
+    first = datetime.combine(now.date(), time(t_local.hour, t_local.minute, tzinfo=tz))
+    if first <= now:
+        first += timedelta(days=1)
+    # Align the first run to the next slot that matches the N-day cadence starting tomorrow
+    context.job_queue.run_repeating(
+        fire_reminder,
+        interval=timedelta(days=n_days),
+        first=first.astimezone(timezone.utc),
+        name=rid,
+        data={"chat_id": chat_id, "rid": rid, "text": text, "human": human},
+    )
+
+
+def schedule_every_x_hours(context: ContextTypes.DEFAULT_TYPE, chat_id: int, rid: str, text: str, human: str, x_hours: int):
+    context.job_queue.run_repeating(
+        fire_reminder,
+        interval=timedelta(hours=x_hours),
+        first=timedelta(seconds=5),
+        name=rid,
+        data={"chat_id": chat_id, "rid": rid, "text": text, "human": human},
+    )
+
+
+async def restore_jobs(app):
+    store = load_store()
+    for chat_id_str, bucket in store.items():
+        chat_id = int(chat_id_str)
+        tzname = bucket.get("tz", DEFAULT_TZ)
+        try:
+            tz = ZoneInfo(tzname)
+        except Exception:
+            tz = ZoneInfo("UTC")
+        for rid, r in bucket.get("reminders", {}).items():
+            text = r.get("text")
+            tp = r.get("type")
+            human = r.get("human", "")
+            hour = r.get("hour")
+            minute = r.get("minute")
+            if tp == TYPE_ONE and r.get("dt"):
+                d = date.fromisoformat(r["dt"])
+                dt_local = datetime(d.year, d.month, d.day, hour or 0, minute or 0, tzinfo=tz)
+                if dt_local > datetime.now(tz):
+                    when_utc = dt_local.astimezone(timezone.utc)
+                    schedule_once(app, chat_id, rid, text, human, when_utc)
+            elif tp == TYPE_DAILY:
+                t_local = time(hour or 0, minute or 0, tzinfo=tz)
+                schedule_daily(app, chat_id, rid, text, human, t_local)
+            elif tp == TYPE_EVERY_N_DAYS:
+                n = int(r.get("n_days") or 1)
+                t_local = time(hour or 0, minute or 0, tzinfo=tz)
+                schedule_every_n_days(app, chat_id, rid, text, human, t_local, n, tz)
+            elif tp == TYPE_EVERY_X_HOURS:
+                x = int(r.get("x_hours") or 1)
+                schedule_every_x_hours(app, chat_id, rid, text, human, x)
+
+
+async def post_init(app):
+    await restore_jobs(app.job_queue)
+
+
+def build_app():
+    app = ApplicationBuilder().token(TOKEN).post_init(restore_jobs).build()
+
+    conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(cb_router)],
+        states={
+            AWAIT_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_text)],
+            AWAIT_TYPE: [CallbackQueryHandler(cb_router)],
+            AWAIT_N_DAYS: [CallbackQueryHandler(cb_router)],
+            AWAIT_X_HOURS: [CallbackQueryHandler(cb_router)],
+            CAL_PICK: [CallbackQueryHandler(cb_router)],
+            PICK_HOUR: [CallbackQueryHandler(cb_router)],
+            PICK_MINUTE: [CallbackQueryHandler(cb_router)],
+        },
+        fallbacks=[CallbackQueryHandler(cb_router)],
+        allow_reentry=True,
+        name="reminder_flow",
+        persistent=False,
+    )
+
+    app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("tz", tz_cmd))
     app.add_handler(CommandHandler("list", list_cmd))
-
-    # Спочатку розмова
+    app.add_handler(CommandHandler("completed", completed_cmd))
     app.add_handler(conv)
-    # Потім загальні меню/керування
-    app.add_handler(CallbackQueryHandler(menu_cb, pattern="^(menu_|back_main|pause:|resume:|del:)"))
+    app.add_handler(CallbackQueryHandler(cb_router))
 
-    log.info("bot ready")
     return app
 
-# ---------------------- MAIN ----------------------
+
 if __name__ == "__main__":
     if not TOKEN:
-        raise SystemExit("No TELEGRAM_TOKEN provided")
-    application = build_application()
-    application.run_polling(close_loop=False)
+        raise SystemExit("TELEGRAM_TOKEN env var is not set")
+    app = build_app()
+    app.run_polling(close_loop=False)
